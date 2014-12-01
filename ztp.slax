@@ -1,0 +1,467 @@
+/*
+ * ----------------------------------------------------------------------------
+ * Author         : Jeremy Schulman
+ * Version        : 1.1
+ * Last Modified  : 2012-jun-01
+ * Platform       : EX4200
+ * Release        : last tested on 11.4
+ * Description    : 
+ *
+ *    This file contains the Zero Touch Provisioning (ZTP) script
+ *    this is invoked by network.conf as part of the EX 
+ *    autoinstallation process.  
+ *
+ *    This ZTP script makes use of the LLDP parent information to 
+ *    configure the device by "network location".
+ *
+ *    The network.conf must contain an the following:
+ *
+         system { delete: autoinstallation; }
+         event-options {
+            generate-event { ztp-autoi time-interval 60; }
+            policy ztp-autoi {
+              events ztp-autoi;
+              then {
+                execute-commands {
+                   commands {
+                     "op url ftp://192.168.2.2/ztp.slax interface ge-0/0/0 server 192.168.2.2";
+                   }
+                }
+              }
+            }
+         }
+ *
+ *    The 'interface' parameter indicates the port used to LLDP with the parent device, and
+ *    the 'server' parameter indicates the FTP server where the configuration files are 
+ *    located.  Note that this FTP server does not need to be same where the lldp-config.slax
+ *    script is located.
+ *
+ *    This script (lldp-config.slax) will download a device specific config 
+ *    file from the $server using the filename format of "JUNOS-%s-%p.conf" where
+ *       %s = system name of LLDP parent device
+ *       %p = port of LLDP parent device, with "/" replaced with "_"
+ *
+ *    For example, if the EX switch is connected to a parent device with
+ *    a system name of "ex2" on "ge-0/0/10", then this script will attempt
+ *    to download a file called "JUNOS-ex2-ge-0_0_10.conf"
+ *
+ *    This script will commit the configuration and then "register" device
+ *    specific information with the $server.  Refer to template
+ *    ztp:on-config-complete() for further details on the registration.
+ *
+ * ----------------------------------------------------------------------------
+ * Copyright (c) 2011-2012  Juniper Networks. All Rights Reserved.
+ *
+ * YOU MUST ACCEPT THE TERMS OF THIS DISCLAIMER TO USE THIS SOFTWARE
+ * 
+ * JUNIPER IS WILLING TO MAKE THE INCLUDED SCRIPTING SOFTWARE AVAILABLE TO YOU
+ * ONLY UPON THE CONDITION THAT YOU ACCEPT ALL OF THE TERMS CONTAINED IN THIS
+ * DISCLAIMER. PLEASE READ THE TERMS AND CONDITIONS OF THIS DISCLAIMER
+ * CAREFULLY.
+ *
+ * THE SOFTWARE CONTAINED IN THIS FILE IS PROVIDED "AS IS." JUNIPER MAKES NO
+ * WARRANTIES OF ANY KIND WHATSOEVER WITH RESPECT TO SOFTWARE. ALL EXPRESS OR
+ * IMPLIED CONDITIONS, REPRESENTATIONS AND WARRANTIES, INCLUDING ANY WARRANTY
+ * OF NON-INFRINGEMENT OR WARRANTY OF MERCHANTABILITY OR FITNESS FOR A
+ * PARTICULAR PURPOSE, ARE HEREBY DISCLAIMED AND EXCLUDED TO THE EXTENT
+ * ALLOWED BY APPLICABLE LAW.
+ *
+ * IN NO EVENT WILL JUNIPER BE LIABLE FOR ANY LOST REVENUE, PROFIT OR DATA, OR
+ * FOR DIRECT, SPECIAL, INDIRECT, CONSEQUENTIAL, INCIDENTAL OR PUNITIVE DAMAGES
+ * HOWEVER CAUSED AND REGARDLESS OF THE THEORY OF LIABILITY ARISING OUT OF THE 
+ * USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF JUNIPER HAS BEEN ADVISED OF 
+ * THE POSSIBILITY OF SUCH DAMAGES.
+ */
+ 
+version 1.0;
+
+/* Junos standard namespaces */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+
+/* EXSLT extensions and app specific namespaces */
+ns exsl extension = "http://exslt.org/common";
+ns func extension = "http://exslt.org/functions";
+ns ztp = "http://xml.juniper.net/junos/ztp";
+
+import "/var/run/scripts/import/junos.xsl";
+
+param $SWVER;
+param $interface;
+param $server;
+
+var $CONFIG-PREFIX = "JUNOS-";
+var $REGISTER-PREFIX = "REGISTER-";
+
+var $TMP-DIR = "/tmp/";
+var $CONFIG-DIR = "ftp://" _ $server _ "/configs/";
+var $UPLOAD-DIR = "ftp://" _ $server _ "/uploads/";
+
+var $EVENT-POLICY = "ztp-autoi";             /* as defined in network.conf file */
+var $SYSLOG_TAG = "ztp-config: ";
+var $SYSLOG = "external.notice";
+
+/* !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!!                      MAIN ENTRY                        !!!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
+ 
+match / {
+   
+   /* the network.conf config may have a "fast poll" set, so make sure that this script does not
+      run more than once in one minute. */
+   
+   if(not( jcs:dampen( $SYSLOG_TAG, 1, 1 ))) {
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, "dampen exit OK." );
+      <xsl:message terminate="yes">;
+   }
+   
+   /* open connection to Junos management for XML/API processing */
+   
+   var $jnx = jcs:open();
+
+   /* --------------------------------------------------------------------- */
+   /* if $SWVER is specificed, then we need to get the current s/w version  */
+   /* since we want to check this to see if download new image is necessary */
+   /* --------------------------------------------------------------------- */   
+   
+   if( $SWVER ) {
+      var $swver = ztp:junos-version( $jnx );
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, "Junos version is ", $swver );
+      if( $swver != $SWVER ) {
+         expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, "Junos software needs to be ", $SWVER, " ... time to upgrade ..." );
+      }
+   }
+   
+   /* ------------------------------------------------------- */   
+   /* get the LLDP neighbor information for the $interface    */
+   /* using <command> since the XML-RPC is not currently      */
+   /* supported; as of 11.4                                   */
+   /* ------------------------------------------------------- */      
+   
+   var $lldp-nei-cmd = <command> "show lldp neighbors interface " _ $interface; 
+   var $lldp-nei-rsp = jcs:execute( $jnx, $lldp-nei-cmd );
+   var $lldp-nei = $lldp-nei-rsp/lldp-neighbor-information[lldp-local-interface == concat($interface,".0")];
+  
+   /* ------------------------------------------------------ */
+   /* when we have an LLDP nei for $interface, start the ZTP */
+   /* ------------------------------------------------------ */   
+   
+   if( $lldp-nei ) {
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, "[0] starting ... LLDP established on interface ", $interface );
+      call ztp:on-lldp-neighbor( $jnx, $ztp-step = 1, $lldp-nei );
+   }
+   else {
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, "waiting ... no LLDP neighbor for interface yet ... ", $interface );
+   }
+   
+   expr jcs:close( $jnx );   
+}
+
+/* -----------------------------------------------------------------------
+   TEMPLATE: ztp:on-lldp-neighbor
+   -----------------------------------------------------------------------
+   this template is called from "main" when the LLDP neighbor is
+   established on $interface.
+   ----------------------------------------------------------------------- */ 
+   
+template ztp:on-lldp-neighbor( $jnx, $ztp-step, $lldp-nei )
+{
+   var $syslog_step = "[" _ $ztp-step _ "] ";
+   
+   /* ------------------------------------------------------- */
+   /* formulate the device network-location specific filename */
+   /* ------------------------------------------------------- */   
+   
+   var $parent-system = $lldp-nei/lldp-remote-system-name;
+   var $parent-port = $lldp-nei/lldp-remote-port-description;
+   var $parent-ifd = translate(substring-before( $parent-port, ".0" ), "/", "_" );
+   var $config-file = $CONFIG-PREFIX _ $parent-system _ "-" _ $parent-ifd _ ".conf";
+   
+   /* ------------------------------------------------ */
+   /* copy the configuration file from the FTP $server */
+   /* ------------------------------------------------ */   
+   
+   var $src-file = $CONFIG-DIR _ $config-file;
+   var $dst-file = $TMP-DIR _ $config-file;
+   
+   expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "retrieving file ", $src-file );
+   
+   var $cpy-cmd = <file-copy> { <source> $src-file; <destination> $dst-file; }
+   
+   var $cpy-rsp = jcs:execute( $jnx, $cpy-cmd );
+   if( $cpy-rsp//self::xnm:error ) {
+      var $header = $syslog_step _ "ERROR: unable to copy file: " _ $src-file;
+      call syslog-messages( $header, $messages = $cpy-rsp//self::xnm:error/message );
+   }
+   else {
+      
+      /* --------------------------------------------  */
+      /* now retrieve the contents of the file since   */
+      /* we're going to add to this as part of the     */
+      /* ZTP configuration change                      */
+      /* --------------------------------------------- */
+      
+      var $get-cmd = <file-get> { <encoding> "ascii"; <filename> $dst-file; }
+      var $get-rsp = jcs:execute( $jnx, $get-cmd );
+      if( $get-rsp/file-contents ) {
+
+         /* ---------------- */
+         /*  GOTO NEXT STEP  */
+         /* ---------------- */         
+
+         call ztp:on-config-file( $jnx, $ztp-step = $ztp-step+1, $lldp-nei, $file-contents = $get-rsp/file-contents );
+      }
+      else {
+         expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "ERROR: file ", $dst-file, " has no contents." );
+      }
+   }
+}
+
+/* -----------------------------------------------------------------------
+   TEMPLATE: ztp:on-config-file
+   -----------------------------------------------------------------------
+   this template is called once the device specific configuration file
+   has been downloaded from the $server and the contents are made 
+   available for processing.
+   ----------------------------------------------------------------------- */ 
+
+template ztp:on-config-file( $jnx, $ztp-step, $lldp-nei, $file-contents )
+{
+   var $syslog_step = "[" _ $ztp-step _ "] ";
+      
+   /* could do something intelligent here to look at contents to see if it's a 
+      text load, xml load, or set load ... for now, just assuming text load */
+      
+   var $load-cmd = <load-configuration format="text" action="replace"> { <configuration-text> {
+      copy-of string( $file-contents );
+
+      /* remove the ZTP event trigger that was part of network.conf */
+      expr "event-options { ";
+      expr    "delete: policy " _ $EVENT-POLICY _ ";";
+      expr    "generate-event { delete: " _ $EVENT-POLICY _ "; }";
+      expr "}";      
+      
+   }}
+   
+   var $load = ztp:load-config( $jnx, $load-cmd );
+   
+   if(not( $load/message )) { 
+      
+      /* ---------------- */
+      /*  GOTO NEXT STEP  */
+      /* ---------------- */      
+      
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "loaded config OK" );
+      call ztp:on-config-complete( $jnx, $ztp-step = $ztp-step + 1, $lldp-nei );
+   }
+}
+
+
+/* -----------------------------------------------------------------------
+   TEMPLATE: ztp:on-config-complete
+   -----------------------------------------------------------------------
+   this template is called once the device specific configuration file has 
+   been successfully committed onto the device   
+   ----------------------------------------------------------------------- */ 
+   
+template ztp:on-config-complete( $jnx, $ztp-step, $lldp-nei )
+{
+   var $syslog_step = "[" _ $ztp-step _ "] ";
+   
+   /* ------------------------------- */
+   /* retrieve LLDP local information */
+   /* ------------------------------- */   
+
+   var $lldp-lcl = jcs:execute( $jnx, 'get-lldp-local-info' );  
+   var $macaddr = $lldp-lcl/lldp-local-chassis-id;
+   var $mgmt-port = $lldp-lcl/lldp-local-port-description;
+   var $sysname = $lldp-lcl/lldp-local-system-name;
+   var $sysdesc = $lldp-lcl/lldp-local-system-descr;
+      
+   /* -------------------------------- */   
+   /* show interface on LLDP mgmt port */
+   /* -------------------------------- */      
+   
+   var $mgmtintf-cmd = <get-interface-information> {
+      <interface-name> substring-before( $mgmt-port, ".0" ); 
+   }
+   var $mgmtintf-rsp = jcs:execute( $jnx, $mgmtintf-cmd );
+   var $inetpflen = substring-after( $mgmtintf-rsp//ifa-destination, "/" );   
+   var $inetaddr = $mgmtintf-rsp//ifa-local _ "/" _ $inetpflen;
+   var $inetaddrp = jcs:parse-ip( $inetaddr );
+  
+   /* ---------------------------------------------------- */
+   /*    Ping the LLDP remote management interface and     */
+   /*    log the results ....                              */
+   /* ---------------------------------------------------- */
+   
+   var $lcl-inethost = string( $inetaddrp[1] );
+   var $rmt-inethost = string( $lldp-nei//lldp-remote-management-address );
+   
+   var $ping = ztp:ping( $jnx, $rmt-inethost, $lcl-inethost );
+   
+   if( $ping/ping-success ) {
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step,
+         "PING-OK: LLDP remote inet: ", $rmt-inethost );
+   }
+   else {
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, 
+         "ERROR: unable to ping ", $rmt-inethost );
+   }
+
+   /* ---------------------------------------------------- */
+   /*    Now create "register" file and ftp copy it to     */
+   /*    the remote file server                            */
+   /* ---------------------------------------------------- */  
+
+   /* extract the version and build-date from the LLDP system description */
+   
+   var $sysdesc_regx = jcs:regex( "version (.*) Build date: (.*)", $sysdesc);
+   var $sw-ver = $sysdesc_regx[2];
+   var $sw-date = normalize-space( $sysdesc_regx[3] );
+   
+   /* retrieve chassis inventory */
+   
+   var $inv = jcs:execute( $jnx, 'get-chassis-inventory' );
+   var $hw-model = $inv/chassis/description;
+   var $hw-snum = $inv/chassis/serial-number;  
+   
+   var $lcl-file = $TMP-DIR _ $sysname _ ".txt";
+   
+   var $fileput-cmd = <file-put> { 
+      <filename> $lcl-file;
+      <permission> "644";
+      <encoding> "ascii";
+      <delete-if-exist>;
+      <file-contents> {
+         expr 'sys.name="' _ $sysname _ '"\n';
+         expr 'hw.model="' _ $hw-model _ '"\n';
+         expr 'hw.serial="' _ $hw-snum _ '"\n';
+         expr 'hw.macaddr="' _ $macaddr _ '"\n';
+         expr 'sw.version="' _ $sw-ver _ '"\n';
+         expr 'sw.date="' _ $sw-date _ '"\n';
+         expr 'mgt.inet.addr="' _ $inetaddr _ '"\n';
+         expr 'mgt.inet.host="' _ $lcl-inethost _ '"\n';
+         expr 'mgt.inet.pflen="' _ $inetaddrp[3] _ '"\n';
+         expr 'mgt.inet.network="' _ $inetaddrp[4] _ '"\n';
+         expr 'mgt.inet.netmask="' _ $inetaddrp[5] _ '"\n';
+         expr 'mgt.macddr="' _ $mgmtintf-rsp//hardware-physical-address _ '"\n';
+         expr 'rmt.name="' _ $lldp-nei//lldp-remote-system-name _ '"\n';
+         expr 'rmt.inet.host="' _ $rmt-inethost  _ '"\n';
+         expr 'rmt.port="' _ $lldp-nei//lldp-remote-port-description _ '"\n';
+         expr 'rmt.chassis-id="' _ $lldp-nei//lldp-remote-chassis-id _ '"\n';
+      }
+   }
+   
+   /* save the file to the local disk,... */
+  
+   var $fileput-rsp = jcs:execute( $jnx, $fileput-cmd );
+   
+   /* --------------------------------- */
+   /* now copy it up to the FTP $server */
+   /* --------------------------------- */   
+   
+   var $timest = translate( $localtime-iso," :-","_");
+   var $rmt-file = $UPLOAD-DIR _ $REGISTER-PREFIX _ $sysname _ "@" _ $timest _ ".txt";
+ 
+   var $filecpy-cmd = <file-copy> { <source> $lcl-file; <destination> $rmt-file; }
+   var $filecpy-rsp = jcs:execute( $jnx, $filecpy-cmd );
+   if( $filecpy-rsp//self::xnm:error ) {
+      var $header = $syslog_step _ "ERROR: unable to register system";
+      call syslog-messages( $header, $messages = $filecpy-rsp//self::xnm:error/message );
+   }
+   else {
+      
+      /* ---------------- */
+      /*  GOTO NEXT STEP  */
+      /* ---------------- */
+      
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "system registered ", $rmt-file, " on server ", $server );
+      call ztp:on-register-complete( $jnx, $ztp-step = $ztp-step + 1, $lldp-nei );
+   }
+}
+
+/* -----------------------------------------------------------------------
+   TEMPLATE: ztp:on-register-complete
+   -----------------------------------------------------------------------
+   this template is called once the device has registered itself to
+   the server ... at this point, the process is really done 
+   ----------------------------------------------------------------------- */ 
+   
+template ztp:on-register-complete( $jnx, $ztp-step, $lldp-nei )
+{
+   var $syslog_step = "[" _ $ztp-step _ "] ";
+   
+   expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "completed OK" );
+   
+   /* --------- */
+   /*  THE END  */
+   /* --------- */
+}
+
+/* !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!!            "Helper" Functions/Templates                !!!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
+
+<func:function name="ztp:ping">
+{
+   param $jnx;
+   param $_host_;
+   param $_source_;
+   
+   var $cmd = <ping> { <host> $_host_;
+      <no-resolve>;
+      <source> $_source_;
+      <count> 1;
+   }
+   
+   var $rsp = jcs:execute( $jnx, $cmd );
+   
+   <func:result select="exsl:node-set($rsp)">;
+}
+
+<func:function name="ztp:junos-version">
+{
+   param $jnx;
+   
+   var $cmd = <get-configuration> { <configuration> { <version>; }}
+   var $ver = jcs:execute( $jnx, $cmd )//version;
+   
+   <func:result select="string($ver)">;
+}
+
+/* this function is used to load/commit changes to the configuration; no locking */
+
+<func:function name="ztp:load-config">
+{
+   param $jnx;
+   param $load-cmd;
+   
+   var $load-rsp = jcs:execute( $jnx, $load-cmd );
+   if( $load-rsp//self::xnm:error ) {
+      call syslog-messages( $header = "unable to load configuration", $messages = $load-rsp//self::xnm:error/message );
+      <func:result select="$load-rsp//self::xnm:error">;
+   }
+   else { 
+      var $commit-rsp = jcs:execute( $jnx, "commit-configuration" );
+      if( $commit-rsp//self::xnm:error ) {
+         call syslog-messages( $header = "unable to commit configuration", $messages = $commit-rsp//self::xnm:error/message );
+         <func:result select="exsl:node-set($commit-rsp//self::xnm:error)">;
+      }
+      else {
+         <func:result select="/null">;
+      }
+   }
+}
+
+/* this template is used to dump warning/error messages to syslog */
+
+template syslog-messages( $header, $messages )
+{
+   expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $header );
+   for-each( $messages ) {
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, "message[ ", ., "]");
+   }
+}
+
